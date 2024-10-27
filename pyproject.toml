@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "mgl869-lab"
+version = "0.1.0"
+description = ""
+authors = ["Matteo D. <mattdecorsaire@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+requests = "2.32.3"
+python-dotenv = "1.0.1"
+rich = "13.9.3"
+toml = "0.10.2"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
