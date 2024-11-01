@@ -2,7 +2,7 @@ import subprocess
 import csv
 import os
 from datetime import datetime
-import re
+import regex
 from typing import Dict, List, Tuple
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskID
@@ -13,12 +13,16 @@ import sys
 from rich.traceback import install
 from git import Repo
 from git.exc import GitCommandError, InvalidGitRepositoryError
+from packaging.version import Version
+import shutil
 
 # Configuration
 HIVE_REPO_PATH = "data/hive"  # Chemin vers le dépôt Hive
 OUTPUT_CSV = "hive_metrics.csv"  # Nom du fichier de sortie
 TEMP_DB_PREFIX = "understand_db_"  # Préfixe pour les bases de données temporaires
 LOG_LEVEL = "INFO"  # Niveau de log (INFO, DEBUG, WARNING, ERROR)
+
+VERSION_TAG_REGEX = regex.compile(r"^(?:rel\/)?release-(?P<version>[234]\.\d+\.\d+)$")
 
 # Installation du traceback Rich
 install(show_locals=True)
@@ -27,7 +31,8 @@ console = Console()
 
 
 class HiveMetricsCollector:
-    def __init__(self):
+    def __init__(self, und: str = "und"):
+        self.und = und
         self.repo_path = Path(HIVE_REPO_PATH).resolve()
         self.output_csv = Path(OUTPUT_CSV).resolve()
 
@@ -74,21 +79,20 @@ class HiveMetricsCollector:
     def log_error(self, message: str):
         console.print(f"[red]ERROR: {message}[/red]")
 
-    def get_version_commits(self) -> List[Tuple[str, str]]:
+    def get_version_commits(self) -> List[Tuple[Version, str]]:
         """
         Récupère les commits correspondant aux versions de Hive en utilisant GitPython.
         """
         with console.status("[bold green]Récupération des versions...") as status:
             try:
                 # Récupérer tous les tags triés par date
-                tags = sorted(
-                    self.repo.tags,
-                    key=lambda t: t.commit.committed_datetime
-                )
-
                 version_commits = []
-                for tag in tags:
-                    version = tag.name
+                for tag in self.repo.tags:
+                    match = VERSION_TAG_REGEX.fullmatch(tag.name)
+                    if match is None:
+                        continue
+
+                    version = Version(match.group("version"))
                     commit = tag.commit
                     version_commits.append((version, commit.hexsha))
                     self.log_debug(f"Version trouvée: {version} ({commit.hexsha[:8]})")
@@ -96,6 +100,8 @@ class HiveMetricsCollector:
             except GitCommandError as e:
                 self.log_error(f"Erreur lors de la récupération des tags Git: {e}")
                 sys.exit(1)
+
+        version_commits.sort(key=lambda x: x[0])
 
         # Afficher un résumé des versions trouvées
         table = Table(title="Versions détectées")
@@ -107,8 +113,8 @@ class HiveMetricsCollector:
         for version, commit_id in version_commits:
             commit = self.repo.commit(commit_id)
             commit_date = commit.committed_datetime.strftime("%Y-%m-%d %H:%M")
-            db_name = f"{TEMP_DB_PREFIX}{version.replace('.', '_')}"
-            table.add_row(version, commit_id[:8], commit_date, db_name)
+            db_name = f"{TEMP_DB_PREFIX}{str(version).replace('.', '_')}"
+            table.add_row(str(version), commit_id[:8], commit_date, db_name)
 
         console.print(table)
         return version_commits
@@ -124,7 +130,7 @@ class HiveMetricsCollector:
             self.log_error(f"Erreur lors du checkout du commit {commit_id}: {e}")
             sys.exit(1)
 
-    def create_understand_db(self, db_path: str):
+    def create_understand_db(self, commit_id: str, db_path: str):
         """
         Crée une base de données Understand pour le code actuel
         """
@@ -132,49 +138,62 @@ class HiveMetricsCollector:
             try:
                 # Créer la base de données
                 self.log_debug("Création de la base de données Understand")
-                subprocess.run(f"und create -languages java c++ -db {db_path}",
-                               shell=True, check=True, capture_output=True)
+                subprocess.run([
+                    self.und, "create",
+                    "-gitrepo", self.repo_path,
+                    "-gitcommit", commit_id,
+                    "-languages", "java", "c++",
+                    "-db", db_path,
+                ], check=True)
 
                 # Ajouter les fichiers source
                 self.log_debug("Ajout des fichiers source")
-                subprocess.run(f"und add {self.repo_path} -db {db_path}",
-                               shell=True, check=True, capture_output=True)
+                subprocess.run([self.und, "add", self.repo_path, "-db", db_path], check=True, capture_output=True)
 
                 # Analyser
                 self.log_debug("Analyse du code")
-                subprocess.run(f"und analyze -db {db_path}",
-                               shell=True, check=True, capture_output=True)
+                subprocess.run([self.und, "analyze", "-db", db_path], check=True, capture_output=True)
 
             except subprocess.CalledProcessError as e:
-                self.log_error(f"Erreur lors de la création de la base Understand: {e}")
+                self.log_error(f"Erreur lors de la création de la base Understand")
                 if os.path.exists(db_path):
-                    os.remove(db_path)
-                sys.exit(1)
+                    shutil.rmtree(db_path)
+                raise
 
-    def get_metrics(self, db_path: str) -> List[Dict]:
+    def get_metrics(self, db_path: str, csv_path: str) -> List[Dict]:
         """
         Extrait les métriques de la base de données Understand
         """
         metrics_list = []
-        metrics_str = ",".join(self.metrics)
 
         with console.status("[bold green]Extraction des métriques...") as status:
-            try:
-                cmd = f"und metrics {metrics_str} -db {db_path}"
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
-                self.log_debug(f"Extraction des métriques depuis {db_path}")
-            except subprocess.CalledProcessError as e:
-                self.log_error(f"Erreur lors de l'extraction des métriques: {e}")
-                return []
+            if not os.path.exists(csv_path):
+                try:
+                    subprocess.run([
+                        self.und, "metrics", "-db", db_path,
+                    ], capture_output=False, text=True, check=True)
+                    self.log_debug(f"Extraction des métriques depuis {db_path}")
+                except subprocess.CalledProcessError as e:
+                    self.log_error(f"Erreur lors de l'extraction des métriques: {e}")
+                    return []
 
-            for line in result.stdout.splitlines()[1:]:
-                values = line.strip().split(',')
-                if len(values) == len(self.metrics) + 1:
-                    metrics_dict = {
-                        'File': values[0],
-                        **{metric: value for metric, value in zip(self.metrics, values[1:])}
-                    }
-                    metrics_list.append(metrics_dict)
+            with open(csv_path, "r") as csv_file:
+                is_header = True
+                for line in csv_file:
+                    if is_header:
+                        is_header = False
+                        continue
+
+                    values = line.strip().split(',')
+                    if values[0] != "File":
+                        continue
+
+                    if len(values) == len(self.metrics) + 1:
+                        metrics_dict = {
+                            'File': values[0],
+                            **{metric: value for metric, value in zip(self.metrics, values[1:])}
+                        }
+                        metrics_list.append(metrics_dict)
 
         return metrics_list
 
@@ -185,7 +204,7 @@ class HiveMetricsCollector:
         try:
             self.log_debug("Nettoyage du repo Git")
             self.repo.git.clean('-fd')
-            self.repo.git.checkout('main')  # ou 'master' selon le repo
+            self.repo.git.checkout('master')
         except GitCommandError as e:
             self.log_warning(f"Erreur lors du nettoyage du repo: {e}")
 
@@ -213,9 +232,9 @@ class HiveMetricsCollector:
             ) as progress:
                 task = progress.add_task("[cyan]Traitement des versions...", total=total_versions)
 
-                with open(self.output_csv, 'w', newline='') as csvfile:
+                with open(self.output_csv, 'w', newline='') as csv_out:
                     fieldnames = ['Version', 'CommitId', 'File'] + self.metrics
-                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                    writer = csv.DictWriter(csv_out, fieldnames=fieldnames)
                     writer.writeheader()
 
                     for version, commit_id in version_commits:
@@ -225,11 +244,13 @@ class HiveMetricsCollector:
                         self.checkout_version(commit_id)
 
                         # Créer une base de données Understand temporaire
-                        db_path = f"{TEMP_DB_PREFIX}{version.replace('.', '_')}"
-                        self.create_understand_db(db_path)
+                        db_path = f"data/{TEMP_DB_PREFIX}{str(version).replace('.', '_')}.und"
+                        csv_path = db_path.rsplit(".", 1)[0] + ".csv"
+                        if not os.path.isfile(csv_path):
+                            self.create_understand_db(commit_id, db_path)
 
                         # Collecter les métriques
-                        metrics_list = self.get_metrics(db_path)
+                        metrics_list = self.get_metrics(db_path, csv_path)
 
                         # Écrire dans le CSV
                         for metrics in metrics_list:
@@ -242,7 +263,7 @@ class HiveMetricsCollector:
 
                         # Nettoyer
                         if os.path.exists(db_path):
-                            os.remove(db_path)
+                            shutil.rmtree(db_path)
                             self.log_debug(f"Suppression de la base de données temporaire {db_path}")
 
                         progress.advance(task)
@@ -255,8 +276,8 @@ class HiveMetricsCollector:
 
 
 def main():
+    collector = HiveMetricsCollector(os.environ.get("UND_PATH"))
     try:
-        collector = HiveMetricsCollector()
         collector.collect_all_metrics()
     except KeyboardInterrupt:
         console.print("\n[yellow]Interruption utilisateur détectée. Nettoyage...[/yellow]")

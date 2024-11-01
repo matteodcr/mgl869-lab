@@ -12,6 +12,9 @@ python-dotenv = "1.0.1"
 rich = "13.9.3"
 toml = "0.10.2"
 gitpython = "3.1.43"
+regex = "^2024.9.11"
+packaging = "^24.1"
+pandas = "^2.2.3"
 
 [build-system]
 requires = ["poetry-core"]
